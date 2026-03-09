@@ -72,6 +72,7 @@ struct AppState {
     bool crop_dragging = false;
     bool crop_has_selection = false;
     bool crop_applied = false;
+    std::string applied_crop_filter;
     guint crop_ant_animation_source = 0;
     double crop_dash_offset = 0.0;
     double crop_drag_start_x = 0.0;
@@ -401,6 +402,7 @@ static void send_loadfile(AppState* state, const std::string& uri, const std::st
         state->cut_end_seconds = -1.0;
         stop_crop_tool(state, true);
         state->crop_applied = false;
+        state->applied_crop_filter.clear();
         set_mpv_string_property(state, "vf", "");
         if (state->timeline_marker_layer) {
             gtk_widget_queue_draw(state->timeline_marker_layer);
@@ -908,6 +910,7 @@ static void on_crop_button_clicked(GtkWidget*, gpointer user_data) {
 
     set_mpv_string_property(state, "vf", crop_filter);
     state->crop_applied = true;
+    state->applied_crop_filter = crop_filter;
     stop_crop_tool(state, true);
 }
 
@@ -1176,14 +1179,12 @@ static void on_export_cut_clip_activate(GtkWidget*, gpointer user_data) {
         char* filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
         if (filename) {
             std::string error;
-            const std::string active_filter = get_mpv_string_property(state, "vf");
-            const bool use_crop_export = state->crop_applied && !active_filter.empty() &&
-                                         active_filter.rfind("crop=", 0) == 0;
+            const bool use_crop_export = state->crop_applied && !state->applied_crop_filter.empty();
             const bool exported = use_crop_export
                 ? export_cut_clip_with_ffmpeg_cli(source_uri, filename,
                                                   state->cut_start_seconds,
                                                   state->cut_end_seconds,
-                                                  active_filter,
+                                                  state->applied_crop_filter,
                                                   &error)
                 : export_cut_clip_with_ffmpeg(source_uri, filename,
                                               state->cut_start_seconds,
