@@ -4,8 +4,11 @@
 #include <glib/gstdio.h>
 #include <mpv/client.h>
 #include <mpv/render_gl.h>
+extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/avutil.h>
+}
 #ifdef GDK_WINDOWING_WAYLAND
 #include <gdk/gdkwayland.h>
 #endif
