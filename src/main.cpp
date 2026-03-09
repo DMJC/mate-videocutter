@@ -4,6 +4,8 @@
 #include <glib/gstdio.h>
 #include <mpv/client.h>
 #include <mpv/render_gl.h>
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
 #ifdef GDK_WINDOWING_WAYLAND
 #include <gdk/gdkwayland.h>
 #endif
@@ -33,6 +35,8 @@ struct AppState {
     GtkWidget* fullscreen_toggle_item = nullptr;
     GtkWidget* playback_state_label = nullptr;
     GtkWidget* position_scale = nullptr;
+    GtkWidget* timeline_overlay = nullptr;
+    GtkWidget* timeline_marker_layer = nullptr;
     GtkWidget* volume_scale = nullptr;
     GtkWidget* playback_controls = nullptr;
     GtkWidget* play_pause_image = nullptr;
@@ -54,6 +58,8 @@ struct AppState {
     bool suppress_position_seek = false;
     guint position_update_source = 0;
     std::string current_media_uri;
+    double cut_start_seconds = -1.0;
+    double cut_end_seconds = -1.0;
 };
 
 struct AppConfig {
@@ -368,6 +374,11 @@ static void send_loadfile(AppState* state, const std::string& uri, const std::st
     }
     if (mode == "replace") {
         state->current_media_uri = uri;
+        state->cut_start_seconds = -1.0;
+        state->cut_end_seconds = -1.0;
+        if (state->timeline_marker_layer) {
+            gtk_widget_queue_draw(state->timeline_marker_layer);
+        }
         set_playback_state(state, "Playing");
     }
 }
@@ -578,6 +589,9 @@ static gboolean update_position_scale(gpointer user_data) {
     state->suppress_position_seek = true;
     gtk_range_set_value(GTK_RANGE(state->position_scale), percent);
     state->suppress_position_seek = false;
+    if (state->timeline_marker_layer) {
+        gtk_widget_queue_draw(state->timeline_marker_layer);
+    }
     return G_SOURCE_CONTINUE;
 }
 
@@ -617,6 +631,257 @@ static void show_message_dialog(GtkWindow* parent, GtkMessageType type, const ch
                                                "%s",
                                                message);
     gtk_dialog_run(GTK_DIALOG(dialog));
+    gtk_widget_destroy(dialog);
+}
+
+static double get_media_duration(AppState* state) {
+    if (!state || !state->mpv) {
+        return -1.0;
+    }
+    double duration = -1.0;
+    if (mpv_get_property(state->mpv, "duration", MPV_FORMAT_DOUBLE, &duration) < 0) {
+        return -1.0;
+    }
+    return duration;
+}
+
+static double get_media_position(AppState* state) {
+    if (!state || !state->mpv) {
+        return -1.0;
+    }
+    double position = -1.0;
+    if (mpv_get_property(state->mpv, "time-pos", MPV_FORMAT_DOUBLE, &position) < 0) {
+        return -1.0;
+    }
+    return position;
+}
+
+static gboolean on_timeline_markers_draw(GtkWidget* widget, cairo_t* cr, gpointer user_data) {
+    auto* state = static_cast<AppState*>(user_data);
+    const double duration = get_media_duration(state);
+    if (duration <= 0.0) {
+        return FALSE;
+    }
+
+    const double width = static_cast<double>(gtk_widget_get_allocated_width(widget));
+    const double height = static_cast<double>(gtk_widget_get_allocated_height(widget));
+    if (width <= 0.0 || height <= 0.0) {
+        return FALSE;
+    }
+
+    if (state->cut_start_seconds >= 0.0) {
+        const double x = (state->cut_start_seconds / duration) * width;
+        cairo_set_source_rgb(cr, 0.9, 0.1, 0.1);
+        cairo_set_line_width(cr, 2.0);
+        cairo_move_to(cr, x, 0.0);
+        cairo_line_to(cr, x, height);
+        cairo_stroke(cr);
+    }
+
+    if (state->cut_end_seconds >= 0.0) {
+        const double x = (state->cut_end_seconds / duration) * width;
+        cairo_set_source_rgb(cr, 1.0, 0.85, 0.0);
+        cairo_set_line_width(cr, 2.0);
+        cairo_move_to(cr, x, 0.0);
+        cairo_line_to(cr, x, height);
+        cairo_stroke(cr);
+    }
+
+    return FALSE;
+}
+
+static bool export_cut_clip_with_ffmpeg(const std::string& input_file,
+                                        const std::string& output_file,
+                                        double start_seconds,
+                                        double end_seconds,
+                                        std::string* error) {
+    AVFormatContext* input_ctx = nullptr;
+    AVFormatContext* output_ctx = nullptr;
+    AVPacket packet;
+
+    if (avformat_open_input(&input_ctx, input_file.c_str(), nullptr, nullptr) < 0) {
+        if (error) {
+            *error = "Failed to open input media with FFmpeg.";
+        }
+        return false;
+    }
+
+    if (avformat_find_stream_info(input_ctx, nullptr) < 0) {
+        if (error) {
+            *error = "Failed to read stream information from media.";
+        }
+        avformat_close_input(&input_ctx);
+        return false;
+    }
+
+    if (avformat_alloc_output_context2(&output_ctx, nullptr, nullptr, output_file.c_str()) < 0 || !output_ctx) {
+        if (error) {
+            *error = "Failed to create output container for export.";
+        }
+        avformat_close_input(&input_ctx);
+        return false;
+    }
+
+    std::vector<int64_t> first_pts(input_ctx->nb_streams, AV_NOPTS_VALUE);
+    for (unsigned int i = 0; i < input_ctx->nb_streams; ++i) {
+        AVStream* in_stream = input_ctx->streams[i];
+        AVStream* out_stream = avformat_new_stream(output_ctx, nullptr);
+        if (!out_stream || avcodec_parameters_copy(out_stream->codecpar, in_stream->codecpar) < 0) {
+            if (error) {
+                *error = "Failed to map streams for export.";
+            }
+            avformat_close_input(&input_ctx);
+            avformat_free_context(output_ctx);
+            return false;
+        }
+        out_stream->codecpar->codec_tag = 0;
+        out_stream->time_base = in_stream->time_base;
+    }
+
+    if (!(output_ctx->oformat->flags & AVFMT_NOFILE)) {
+        if (avio_open(&output_ctx->pb, output_file.c_str(), AVIO_FLAG_WRITE) < 0) {
+            if (error) {
+                *error = "Failed to open output file for writing.";
+            }
+            avformat_close_input(&input_ctx);
+            avformat_free_context(output_ctx);
+            return false;
+        }
+    }
+
+    if (avformat_write_header(output_ctx, nullptr) < 0) {
+        if (error) {
+            *error = "Failed to write output media header.";
+        }
+        avformat_close_input(&input_ctx);
+        if (!(output_ctx->oformat->flags & AVFMT_NOFILE)) {
+            avio_closep(&output_ctx->pb);
+        }
+        avformat_free_context(output_ctx);
+        return false;
+    }
+
+    const int64_t start_us = static_cast<int64_t>(start_seconds * AV_TIME_BASE);
+    const int64_t end_us = static_cast<int64_t>(end_seconds * AV_TIME_BASE);
+    av_seek_frame(input_ctx, -1, start_us, AVSEEK_FLAG_BACKWARD);
+
+    bool ok = true;
+    while (av_read_frame(input_ctx, &packet) >= 0) {
+        AVStream* in_stream = input_ctx->streams[packet.stream_index];
+        AVStream* out_stream = output_ctx->streams[packet.stream_index];
+
+        int64_t packet_time_us = AV_NOPTS_VALUE;
+        if (packet.pts != AV_NOPTS_VALUE) {
+            packet_time_us = av_rescale_q(packet.pts, in_stream->time_base, AVRational{1, AV_TIME_BASE});
+        } else if (packet.dts != AV_NOPTS_VALUE) {
+            packet_time_us = av_rescale_q(packet.dts, in_stream->time_base, AVRational{1, AV_TIME_BASE});
+        }
+
+        if (packet_time_us != AV_NOPTS_VALUE) {
+            if (packet_time_us < start_us) {
+                av_packet_unref(&packet);
+                continue;
+            }
+            if (packet_time_us > end_us) {
+                av_packet_unref(&packet);
+                break;
+            }
+        }
+
+        if (first_pts[packet.stream_index] == AV_NOPTS_VALUE) {
+            first_pts[packet.stream_index] = packet.pts;
+        }
+
+        if (packet.pts != AV_NOPTS_VALUE && first_pts[packet.stream_index] != AV_NOPTS_VALUE) {
+            packet.pts -= first_pts[packet.stream_index];
+        }
+        if (packet.dts != AV_NOPTS_VALUE && first_pts[packet.stream_index] != AV_NOPTS_VALUE) {
+            packet.dts -= first_pts[packet.stream_index];
+        }
+        if (packet.pts != AV_NOPTS_VALUE && packet.dts != AV_NOPTS_VALUE && packet.dts > packet.pts) {
+            packet.dts = packet.pts;
+        }
+
+        packet.pts = av_rescale_q_rnd(packet.pts, in_stream->time_base, out_stream->time_base,
+                                      static_cast<AVRounding>(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+        packet.dts = av_rescale_q_rnd(packet.dts, in_stream->time_base, out_stream->time_base,
+                                      static_cast<AVRounding>(AV_ROUND_NEAR_INF | AV_ROUND_PASS_MINMAX));
+        packet.duration = av_rescale_q(packet.duration, in_stream->time_base, out_stream->time_base);
+        packet.pos = -1;
+
+        if (av_interleaved_write_frame(output_ctx, &packet) < 0) {
+            ok = false;
+            if (error) {
+                *error = "Failed while writing exported clip.";
+            }
+            av_packet_unref(&packet);
+            break;
+        }
+        av_packet_unref(&packet);
+    }
+
+    av_write_trailer(output_ctx);
+    avformat_close_input(&input_ctx);
+    if (!(output_ctx->oformat->flags & AVFMT_NOFILE)) {
+        avio_closep(&output_ctx->pb);
+    }
+    avformat_free_context(output_ctx);
+    return ok;
+}
+
+static void on_export_cut_clip_activate(GtkWidget*, gpointer user_data) {
+    auto* state = static_cast<AppState*>(user_data);
+    std::string source_uri = get_mpv_string_property(state, "path");
+    if (source_uri.empty()) {
+        source_uri = state->current_media_uri;
+    }
+    if (source_uri.empty()) {
+        show_message_dialog(GTK_WINDOW(state->window), GTK_MESSAGE_WARNING, "No media is currently loaded.");
+        return;
+    }
+
+    if (state->cut_start_seconds < 0.0 || state->cut_end_seconds < 0.0 || state->cut_end_seconds <= state->cut_start_seconds) {
+        show_message_dialog(GTK_WINDOW(state->window), GTK_MESSAGE_WARNING,
+                            "Set start and end markers first (S for start, E for end).");
+        return;
+    }
+
+    GtkWidget* dialog = gtk_file_chooser_dialog_new("Export Cut Clip",
+                                                     GTK_WINDOW(state->window),
+                                                     GTK_FILE_CHOOSER_ACTION_SAVE,
+                                                     "_Cancel", GTK_RESPONSE_CANCEL,
+                                                     "_Export", GTK_RESPONSE_ACCEPT,
+                                                     nullptr);
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dialog), TRUE);
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dialog), "cut_clip.mp4");
+
+    GtkFileFilter* mp4_filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(mp4_filter, "MP4 video (*.mp4)");
+    gtk_file_filter_add_pattern(mp4_filter, "*.mp4");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), mp4_filter);
+
+    GtkFileFilter* mkv_filter = gtk_file_filter_new();
+    gtk_file_filter_set_name(mkv_filter, "Matroska video (*.mkv)");
+    gtk_file_filter_add_pattern(mkv_filter, "*.mkv");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dialog), mkv_filter);
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        char* filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        if (filename) {
+            std::string error;
+            const bool exported = export_cut_clip_with_ffmpeg(source_uri, filename,
+                                                              state->cut_start_seconds,
+                                                              state->cut_end_seconds,
+                                                              &error);
+            if (exported) {
+                std::string message = std::string("Clip exported to:\n") + filename;
+                show_message_dialog(GTK_WINDOW(state->window), GTK_MESSAGE_INFO, message.c_str());
+            } else {
+                show_message_dialog(GTK_WINDOW(state->window), GTK_MESSAGE_ERROR, error.c_str());
+            }
+            g_free(filename);
+        }
+    }
     gtk_widget_destroy(dialog);
 }
 
@@ -781,6 +1046,28 @@ static gboolean on_window_key_press(GtkWidget*, GdkEventKey* event, gpointer use
             gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(state->playlist_toggle_item), !playlist_visible);
         } else {
             gtk_widget_set_visible(state->playlist_sidebar, !playlist_visible);
+        }
+        return TRUE;
+    }
+
+    if (event->keyval == GDK_KEY_s || event->keyval == GDK_KEY_S) {
+        const double position = get_media_position(state);
+        if (position >= 0.0) {
+            state->cut_start_seconds = position;
+            if (state->timeline_marker_layer) {
+                gtk_widget_queue_draw(state->timeline_marker_layer);
+            }
+        }
+        return TRUE;
+    }
+
+    if (event->keyval == GDK_KEY_e || event->keyval == GDK_KEY_E) {
+        const double position = get_media_position(state);
+        if (position >= 0.0) {
+            state->cut_end_seconds = position;
+            if (state->timeline_marker_layer) {
+                gtk_widget_queue_draw(state->timeline_marker_layer);
+            }
         }
         return TRUE;
     }
@@ -1321,6 +1608,19 @@ static GtkWidget* create_playback_controls(AppState* state) {
     state->position_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.0, 100.0, 1.0);
     gtk_scale_set_draw_value(GTK_SCALE(state->position_scale), FALSE);
     gtk_widget_set_hexpand(state->position_scale, TRUE);
+
+    state->timeline_overlay = gtk_overlay_new();
+    gtk_widget_set_hexpand(state->timeline_overlay, TRUE);
+    gtk_container_add(GTK_CONTAINER(state->timeline_overlay), state->position_scale);
+
+    state->timeline_marker_layer = gtk_drawing_area_new();
+    gtk_widget_set_halign(state->timeline_marker_layer, GTK_ALIGN_FILL);
+    gtk_widget_set_valign(state->timeline_marker_layer, GTK_ALIGN_FILL);
+    gtk_widget_set_hexpand(state->timeline_marker_layer, TRUE);
+    gtk_widget_set_vexpand(state->timeline_marker_layer, TRUE);
+    gtk_overlay_add_overlay(GTK_OVERLAY(state->timeline_overlay), state->timeline_marker_layer);
+    gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(state->timeline_overlay), state->timeline_marker_layer, TRUE);
+
     state->playback_state_label = gtk_label_new("Playback state: Stopped");
     gtk_label_set_xalign(GTK_LABEL(state->playback_state_label), 0.0f);
 
@@ -1331,7 +1631,7 @@ static GtkWidget* create_playback_controls(AppState* state) {
     gtk_box_pack_start(GTK_BOX(button_row), stop_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(button_row), fast_forward_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(button_row), skip_forward_button, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(button_row), state->position_scale, FALSE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(button_row), state->timeline_overlay, TRUE, TRUE, 0);
 
     gtk_box_pack_start(GTK_BOX(center_column), button_row, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(center_column), state->playback_state_label, FALSE, FALSE, 0);
@@ -1360,6 +1660,7 @@ static GtkWidget* create_playback_controls(AppState* state) {
     g_signal_connect(fast_forward_button, "clicked", G_CALLBACK(on_fast_forward_clicked), state);
     g_signal_connect(skip_forward_button, "clicked", G_CALLBACK(on_skip_forward_clicked), state);
     g_signal_connect(state->position_scale, "value-changed", G_CALLBACK(on_position_value_changed), state);
+    g_signal_connect(state->timeline_marker_layer, "draw", G_CALLBACK(on_timeline_markers_draw), state);
     g_signal_connect(state->volume_scale, "value-changed", G_CALLBACK(on_volume_value_changed), state);
     g_signal_connect(fullscreen_button, "clicked", G_CALLBACK(on_fullscreen_button_clicked), state);
 
@@ -1510,11 +1811,14 @@ static GtkWidget* create_menu_bar(AppState* state) {
 
     GtkWidget* prefs_item = gtk_menu_item_new_with_label("Preferences");
     GtkWidget* dump_audio_item = gtk_menu_item_new_with_label("Dump Audio");
+    GtkWidget* export_cut_clip_item = gtk_menu_item_new_with_label("Export Cut Clip");
     GtkWidget* about_item = gtk_menu_item_new_with_label("About");
     g_signal_connect(prefs_item, "activate", G_CALLBACK(on_preferences_activate), state);
     g_signal_connect(dump_audio_item, "activate", G_CALLBACK(on_dump_audio_activate), state);
+    g_signal_connect(export_cut_clip_item, "activate", G_CALLBACK(on_export_cut_clip_activate), state);
     g_signal_connect(about_item, "activate", G_CALLBACK(on_about_activate), state);
     gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), dump_audio_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), export_cut_clip_item);
     gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), gtk_separator_menu_item_new());
     gtk_menu_shell_append(GTK_MENU_SHELL(edit_menu), prefs_item);
     gtk_menu_shell_append(GTK_MENU_SHELL(help_menu), about_item);
