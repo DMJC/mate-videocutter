@@ -15,6 +15,8 @@ extern "C" {
 
 #include "langlist.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
@@ -29,6 +31,8 @@ struct AppState {
     GtkApplication* app = nullptr;
     GtkWidget* window = nullptr;
     GtkWidget* video_area = nullptr;
+    GtkWidget* video_overlay = nullptr;
+    GtkWidget* crop_overlay = nullptr;
     GtkWidget* playlist_sidebar = nullptr;
     GtkWidget* playlist_scroller = nullptr;
     GtkWidget* playlist_view = nullptr;
@@ -42,6 +46,7 @@ struct AppState {
     GtkWidget* timeline_marker_layer = nullptr;
     GtkWidget* volume_scale = nullptr;
     GtkWidget* playback_controls = nullptr;
+    GtkWidget* crop_button = nullptr;
     GtkWidget* play_pause_image = nullptr;
     GtkWidget* player_context_menu = nullptr;
     GtkWidget* show_controls_item = nullptr;
@@ -63,6 +68,20 @@ struct AppState {
     std::string current_media_uri;
     double cut_start_seconds = -1.0;
     double cut_end_seconds = -1.0;
+    bool crop_tool_active = false;
+    bool crop_dragging = false;
+    bool crop_has_selection = false;
+    bool crop_applied = false;
+    guint crop_ant_animation_source = 0;
+    double crop_dash_offset = 0.0;
+    double crop_drag_start_x = 0.0;
+    double crop_drag_start_y = 0.0;
+    double crop_drag_current_x = 0.0;
+    double crop_drag_current_y = 0.0;
+    int crop_x = 0;
+    int crop_y = 0;
+    int crop_width = 0;
+    int crop_height = 0;
 };
 
 struct AppConfig {
@@ -85,6 +104,7 @@ enum PlaylistColumns {
 static void on_open_files_activate(GtkWidget*, gpointer user_data);
 static void on_open_url_activate(GtkWidget*, gpointer user_data);
 static std::string get_mpv_string_property(AppState* state, const char* property);
+static void stop_crop_tool(AppState* state, bool clear_selection);
 
 static std::string file_basename(const std::string& path) {
     const auto slash = path.find_last_of('/');
@@ -379,6 +399,9 @@ static void send_loadfile(AppState* state, const std::string& uri, const std::st
         state->current_media_uri = uri;
         state->cut_start_seconds = -1.0;
         state->cut_end_seconds = -1.0;
+        stop_crop_tool(state, true);
+        state->crop_applied = false;
+        set_mpv_string_property(state, "vf", "");
         if (state->timeline_marker_layer) {
             gtk_widget_queue_draw(state->timeline_marker_layer);
         }
@@ -659,6 +682,236 @@ static double get_media_position(AppState* state) {
     return position;
 }
 
+static void update_crop_button_label(AppState* state) {
+    if (!state || !state->crop_button) {
+        return;
+    }
+    gtk_button_set_label(GTK_BUTTON(state->crop_button), state->crop_tool_active ? "Apply Crop" : "Crop");
+}
+
+static void clear_crop_selection(AppState* state) {
+    if (!state) {
+        return;
+    }
+    state->crop_dragging = false;
+    state->crop_has_selection = false;
+    state->crop_x = 0;
+    state->crop_y = 0;
+    state->crop_width = 0;
+    state->crop_height = 0;
+    if (state->crop_overlay) {
+        gtk_widget_queue_draw(state->crop_overlay);
+    }
+}
+
+static void stop_crop_tool(AppState* state, bool clear_selection) {
+    if (!state) {
+        return;
+    }
+    state->crop_tool_active = false;
+    if (state->crop_ant_animation_source != 0) {
+        g_source_remove(state->crop_ant_animation_source);
+        state->crop_ant_animation_source = 0;
+    }
+    if (clear_selection) {
+        clear_crop_selection(state);
+    }
+    update_crop_button_label(state);
+}
+
+static gboolean animate_crop_ants(gpointer user_data) {
+    auto* state = static_cast<AppState*>(user_data);
+    if (!state->crop_tool_active || !state->crop_has_selection) {
+        return G_SOURCE_CONTINUE;
+    }
+    state->crop_dash_offset += 1.0;
+    if (state->crop_dash_offset > 12.0) {
+        state->crop_dash_offset = 0.0;
+    }
+    if (state->crop_overlay) {
+        gtk_widget_queue_draw(state->crop_overlay);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean on_crop_overlay_draw(GtkWidget*, cairo_t* cr, gpointer user_data) {
+    auto* state = static_cast<AppState*>(user_data);
+    if (!state || (!state->crop_tool_active && !state->crop_has_selection)) {
+        return FALSE;
+    }
+    if (!state->crop_has_selection || state->crop_width <= 0 || state->crop_height <= 0) {
+        return FALSE;
+    }
+
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.12);
+    cairo_rectangle(cr, state->crop_x, state->crop_y, state->crop_width, state->crop_height);
+    cairo_fill(cr);
+
+    const double dashes[] = {6.0, 6.0};
+    cairo_set_line_width(cr, 2.0);
+    cairo_set_dash(cr, dashes, 2, state->crop_dash_offset);
+    cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
+    cairo_rectangle(cr, state->crop_x + 0.5, state->crop_y + 0.5, state->crop_width, state->crop_height);
+    cairo_stroke(cr);
+    cairo_set_dash(cr, dashes, 2, state->crop_dash_offset + 6.0);
+    cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+    cairo_rectangle(cr, state->crop_x + 0.5, state->crop_y + 0.5, state->crop_width, state->crop_height);
+    cairo_stroke(cr);
+
+    return FALSE;
+}
+
+static void update_crop_rect_from_drag(AppState* state) {
+    const double x1 = std::min(state->crop_drag_start_x, state->crop_drag_current_x);
+    const double y1 = std::min(state->crop_drag_start_y, state->crop_drag_current_y);
+    const double x2 = std::max(state->crop_drag_start_x, state->crop_drag_current_x);
+    const double y2 = std::max(state->crop_drag_start_y, state->crop_drag_current_y);
+
+    state->crop_x = static_cast<int>(std::round(x1));
+    state->crop_y = static_cast<int>(std::round(y1));
+    state->crop_width = static_cast<int>(std::round(x2 - x1));
+    state->crop_height = static_cast<int>(std::round(y2 - y1));
+    state->crop_has_selection = state->crop_width > 2 && state->crop_height > 2;
+}
+
+static gboolean on_crop_overlay_button_press(GtkWidget*, GdkEventButton* event, gpointer user_data) {
+    auto* state = static_cast<AppState*>(user_data);
+    if (!event) {
+        return FALSE;
+    }
+    if (event->type == GDK_BUTTON_PRESS && event->button == 3 && state->player_context_menu) {
+        gtk_menu_popup_at_pointer(GTK_MENU(state->player_context_menu), reinterpret_cast<GdkEvent*>(event));
+        return TRUE;
+    }
+    if (!state->crop_tool_active || event->type != GDK_BUTTON_PRESS || event->button != 1) {
+        return FALSE;
+    }
+    state->crop_dragging = true;
+    state->crop_drag_start_x = event->x;
+    state->crop_drag_start_y = event->y;
+    state->crop_drag_current_x = event->x;
+    state->crop_drag_current_y = event->y;
+    update_crop_rect_from_drag(state);
+    gtk_widget_queue_draw(state->crop_overlay);
+    return TRUE;
+}
+
+static gboolean on_crop_overlay_motion_notify(GtkWidget*, GdkEventMotion* event, gpointer user_data) {
+    auto* state = static_cast<AppState*>(user_data);
+    if (!event || !state->crop_tool_active || !state->crop_dragging) {
+        return FALSE;
+    }
+    state->crop_drag_current_x = event->x;
+    state->crop_drag_current_y = event->y;
+    update_crop_rect_from_drag(state);
+    gtk_widget_queue_draw(state->crop_overlay);
+    return TRUE;
+}
+
+static gboolean on_crop_overlay_button_release(GtkWidget*, GdkEventButton* event, gpointer user_data) {
+    auto* state = static_cast<AppState*>(user_data);
+    if (!event || event->button != 1 || !state->crop_tool_active || !state->crop_dragging) {
+        return FALSE;
+    }
+    state->crop_dragging = false;
+    state->crop_drag_current_x = event->x;
+    state->crop_drag_current_y = event->y;
+    update_crop_rect_from_drag(state);
+    gtk_widget_queue_draw(state->crop_overlay);
+    return TRUE;
+}
+
+static bool calculate_crop_filter(AppState* state, std::string* filter) {
+    if (!state || !filter || !state->crop_has_selection || state->crop_width <= 0 || state->crop_height <= 0) {
+        return false;
+    }
+
+    double video_width = 0.0;
+    double video_height = 0.0;
+    if (!get_mpv_double_property(state, "width", &video_width) || !get_mpv_double_property(state, "height", &video_height) ||
+        video_width <= 0.0 || video_height <= 0.0) {
+        return false;
+    }
+
+    const double widget_width = gtk_widget_get_allocated_width(state->video_area);
+    const double widget_height = gtk_widget_get_allocated_height(state->video_area);
+    if (widget_width <= 0.0 || widget_height <= 0.0) {
+        return false;
+    }
+
+    const double scale = std::min(widget_width / video_width, widget_height / video_height);
+    if (scale <= 0.0) {
+        return false;
+    }
+
+    const double content_width = video_width * scale;
+    const double content_height = video_height * scale;
+    const double offset_x = (widget_width - content_width) * 0.5;
+    const double offset_y = (widget_height - content_height) * 0.5;
+
+    const double sel_x1 = std::max(static_cast<double>(state->crop_x), offset_x);
+    const double sel_y1 = std::max(static_cast<double>(state->crop_y), offset_y);
+    const double sel_x2 = std::min(static_cast<double>(state->crop_x + state->crop_width), offset_x + content_width);
+    const double sel_y2 = std::min(static_cast<double>(state->crop_y + state->crop_height), offset_y + content_height);
+
+    if (sel_x2 - sel_x1 <= 2.0 || sel_y2 - sel_y1 <= 2.0) {
+        return false;
+    }
+
+    int crop_x = static_cast<int>(std::round((sel_x1 - offset_x) / scale));
+    int crop_y = static_cast<int>(std::round((sel_y1 - offset_y) / scale));
+    int crop_width = static_cast<int>(std::round((sel_x2 - sel_x1) / scale));
+    int crop_height = static_cast<int>(std::round((sel_y2 - sel_y1) / scale));
+
+    crop_x = std::max(0, std::min(crop_x, static_cast<int>(video_width) - 1));
+    crop_y = std::max(0, std::min(crop_y, static_cast<int>(video_height) - 1));
+    crop_width = std::max(2, std::min(crop_width, static_cast<int>(video_width) - crop_x));
+    crop_height = std::max(2, std::min(crop_height, static_cast<int>(video_height) - crop_y));
+
+    if ((crop_width % 2) != 0 && crop_width > 2) {
+        --crop_width;
+    }
+    if ((crop_height % 2) != 0 && crop_height > 2) {
+        --crop_height;
+    }
+
+    *filter = "crop=" + std::to_string(crop_width) + ":" + std::to_string(crop_height) + ":" +
+              std::to_string(crop_x) + ":" + std::to_string(crop_y);
+    return true;
+}
+
+static void on_crop_button_clicked(GtkWidget*, gpointer user_data) {
+    auto* state = static_cast<AppState*>(user_data);
+    if (!state->crop_tool_active) {
+        clear_crop_selection(state);
+        state->crop_tool_active = true;
+        state->crop_dash_offset = 0.0;
+        if (state->crop_ant_animation_source == 0) {
+            state->crop_ant_animation_source = g_timeout_add(80, animate_crop_ants, state);
+        }
+        update_crop_button_label(state);
+        return;
+    }
+
+    if (!state->crop_has_selection) {
+        stop_crop_tool(state, true);
+        return;
+    }
+
+    std::string crop_filter;
+    if (!calculate_crop_filter(state, &crop_filter)) {
+        show_message_dialog(GTK_WINDOW(state->window), GTK_MESSAGE_WARNING,
+                            "Unable to compute crop area. Please select inside the visible picture.");
+        stop_crop_tool(state, true);
+        return;
+    }
+
+    set_mpv_string_property(state, "vf", crop_filter);
+    state->crop_applied = true;
+    stop_crop_tool(state, true);
+}
+
+
 static gboolean on_timeline_markers_draw(GtkWidget* widget, cairo_t* cr, gpointer user_data) {
     auto* state = static_cast<AppState*>(user_data);
     const double duration = get_media_duration(state);
@@ -832,6 +1085,57 @@ static bool export_cut_clip_with_ffmpeg(const std::string& input_file,
     return ok;
 }
 
+static bool export_cut_clip_with_ffmpeg_cli(const std::string& input_file,
+                                            const std::string& output_file,
+                                            double start_seconds,
+                                            double end_seconds,
+                                            const std::string& crop_filter,
+                                            std::string* error) {
+    gchar* input_q = g_shell_quote(input_file.c_str());
+    gchar* output_q = g_shell_quote(output_file.c_str());
+    gchar* crop_q = g_shell_quote(crop_filter.c_str());
+    gchar* command = g_strdup_printf(
+        "ffmpeg -y -loglevel error -ss %.6f -to %.6f -i %s -vf %s -c:v libx264 -preset veryfast -crf 18 -c:a copy %s",
+        start_seconds,
+        end_seconds,
+        input_q,
+        crop_q,
+        output_q);
+
+    int exit_status = 0;
+    gchar* std_out = nullptr;
+    gchar* std_err = nullptr;
+    GError* spawn_error = nullptr;
+    const gboolean success = g_spawn_command_line_sync(command, &std_out, &std_err, &exit_status, &spawn_error);
+
+    g_free(input_q);
+    g_free(output_q);
+    g_free(crop_q);
+    g_free(command);
+
+    if (!success || spawn_error != nullptr || exit_status != 0) {
+        if (error) {
+            if (spawn_error) {
+                *error = std::string("FFmpeg crop export failed: ") + spawn_error->message;
+            } else if (std_err && *std_err) {
+                *error = std::string("FFmpeg crop export failed: ") + std_err;
+            } else {
+                *error = "FFmpeg crop export failed.";
+            }
+        }
+        if (spawn_error) {
+            g_error_free(spawn_error);
+        }
+        g_free(std_out);
+        g_free(std_err);
+        return false;
+    }
+
+    g_free(std_out);
+    g_free(std_err);
+    return true;
+}
+
 static void on_export_cut_clip_activate(GtkWidget*, gpointer user_data) {
     auto* state = static_cast<AppState*>(user_data);
     std::string source_uri = get_mpv_string_property(state, "path");
@@ -872,10 +1176,19 @@ static void on_export_cut_clip_activate(GtkWidget*, gpointer user_data) {
         char* filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
         if (filename) {
             std::string error;
-            const bool exported = export_cut_clip_with_ffmpeg(source_uri, filename,
-                                                              state->cut_start_seconds,
-                                                              state->cut_end_seconds,
-                                                              &error);
+            const std::string active_filter = get_mpv_string_property(state, "vf");
+            const bool use_crop_export = state->crop_applied && !active_filter.empty() &&
+                                         active_filter.rfind("crop=", 0) == 0;
+            const bool exported = use_crop_export
+                ? export_cut_clip_with_ffmpeg_cli(source_uri, filename,
+                                                  state->cut_start_seconds,
+                                                  state->cut_end_seconds,
+                                                  active_filter,
+                                                  &error)
+                : export_cut_clip_with_ffmpeg(source_uri, filename,
+                                              state->cut_start_seconds,
+                                              state->cut_end_seconds,
+                                              &error);
             if (exported) {
                 std::string message = std::string("Clip exported to:\n") + filename;
                 show_message_dialog(GTK_WINDOW(state->window), GTK_MESSAGE_INFO, message.c_str());
@@ -1072,6 +1385,11 @@ static gboolean on_window_key_press(GtkWidget*, GdkEventKey* event, gpointer use
                 gtk_widget_queue_draw(state->timeline_marker_layer);
             }
         }
+        return TRUE;
+    }
+
+    if (event->keyval == GDK_KEY_Escape && state->crop_tool_active) {
+        stop_crop_tool(state, true);
         return TRUE;
     }
 
@@ -1590,6 +1908,7 @@ static GtkWidget* create_playback_controls(AppState* state) {
     GtkWidget* stop_button = gtk_button_new();
     GtkWidget* fast_forward_button = gtk_button_new();
     GtkWidget* skip_forward_button = gtk_button_new();
+    state->crop_button = gtk_button_new_with_label("Crop");
 
     gtk_button_set_image(GTK_BUTTON(skip_backward_button), gtk_image_new_from_icon_name("media-skip-backward", GTK_ICON_SIZE_BUTTON));
     gtk_button_set_image(GTK_BUTTON(start_button), gtk_image_new_from_icon_name("media-skip-backward", GTK_ICON_SIZE_BUTTON));
@@ -1607,6 +1926,7 @@ static GtkWidget* create_playback_controls(AppState* state) {
     gtk_widget_set_tooltip_text(stop_button, "Stop");
     gtk_widget_set_tooltip_text(fast_forward_button, "Fast Forward");
     gtk_widget_set_tooltip_text(skip_forward_button, "Next in Playlist");
+    gtk_widget_set_tooltip_text(state->crop_button, "Select and apply crop area");
 
     state->position_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0.0, 100.0, 1.0);
     gtk_scale_set_draw_value(GTK_SCALE(state->position_scale), FALSE);
@@ -1634,6 +1954,7 @@ static GtkWidget* create_playback_controls(AppState* state) {
     gtk_box_pack_start(GTK_BOX(button_row), stop_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(button_row), fast_forward_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(button_row), skip_forward_button, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(button_row), state->crop_button, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(button_row), state->timeline_overlay, TRUE, TRUE, 0);
 
     gtk_box_pack_start(GTK_BOX(center_column), button_row, FALSE, FALSE, 0);
@@ -1662,6 +1983,7 @@ static GtkWidget* create_playback_controls(AppState* state) {
     g_signal_connect(stop_button, "clicked", G_CALLBACK(on_stop_clicked), state);
     g_signal_connect(fast_forward_button, "clicked", G_CALLBACK(on_fast_forward_clicked), state);
     g_signal_connect(skip_forward_button, "clicked", G_CALLBACK(on_skip_forward_clicked), state);
+    g_signal_connect(state->crop_button, "clicked", G_CALLBACK(on_crop_button_clicked), state);
     g_signal_connect(state->position_scale, "value-changed", G_CALLBACK(on_position_value_changed), state);
     g_signal_connect(state->timeline_marker_layer, "draw", G_CALLBACK(on_timeline_markers_draw), state);
     g_signal_connect(state->volume_scale, "value-changed", G_CALLBACK(on_volume_value_changed), state);
@@ -2015,6 +2337,10 @@ static void activate(GtkApplication* app, gpointer user_data) {
     GtkWidget* paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
     gtk_box_pack_start(GTK_BOX(root), paned, TRUE, TRUE, 0);
 
+    state->video_overlay = gtk_overlay_new();
+    gtk_widget_set_hexpand(state->video_overlay, TRUE);
+    gtk_widget_set_vexpand(state->video_overlay, TRUE);
+
     state->video_area = gtk_gl_area_new();
     gtk_gl_area_set_use_es(GTK_GL_AREA(state->video_area), FALSE);
     gtk_gl_area_set_required_version(GTK_GL_AREA(state->video_area), 3, 2);
@@ -2025,6 +2351,16 @@ static void activate(GtkApplication* app, gpointer user_data) {
     g_signal_connect(state->video_area, "realize", G_CALLBACK(on_video_area_realize), state);
     g_signal_connect(state->video_area, "unrealize", G_CALLBACK(on_video_area_unrealize), state);
     g_signal_connect(state->video_area, "render", G_CALLBACK(on_video_area_render), state);
+    gtk_container_add(GTK_CONTAINER(state->video_overlay), state->video_area);
+
+    state->crop_overlay = gtk_drawing_area_new();
+    gtk_widget_set_halign(state->crop_overlay, GTK_ALIGN_FILL);
+    gtk_widget_set_valign(state->crop_overlay, GTK_ALIGN_FILL);
+    gtk_widget_set_hexpand(state->crop_overlay, TRUE);
+    gtk_widget_set_vexpand(state->crop_overlay, TRUE);
+    gtk_widget_add_events(state->crop_overlay, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK | GDK_POINTER_MOTION_MASK);
+    gtk_overlay_add_overlay(GTK_OVERLAY(state->video_overlay), state->crop_overlay);
+    gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(state->video_overlay), state->crop_overlay, FALSE);
 
     state->playlist_store = gtk_list_store_new(COL_COUNT, G_TYPE_STRING, G_TYPE_STRING);
     state->playlist_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(state->playlist_store));
@@ -2074,7 +2410,7 @@ static void activate(GtkApplication* app, gpointer user_data) {
     gtk_box_pack_start(GTK_BOX(playlist_button_bar), move_down_button, FALSE, FALSE, 0);
     gtk_box_pack_end(GTK_BOX(state->playlist_sidebar), playlist_button_bar, FALSE, FALSE, 0);
 
-    gtk_paned_pack1(GTK_PANED(paned), state->video_area, TRUE, FALSE);
+    gtk_paned_pack1(GTK_PANED(paned), state->video_overlay, TRUE, FALSE);
     gtk_paned_pack2(GTK_PANED(paned), state->playlist_sidebar, FALSE, FALSE);
 
     state->playback_controls = create_playback_controls(state);
@@ -2083,6 +2419,10 @@ static void activate(GtkApplication* app, gpointer user_data) {
     state->player_context_menu = create_player_context_menu(state);
     gtk_widget_set_events(state->video_area, gtk_widget_get_events(state->video_area) | GDK_BUTTON_PRESS_MASK);
     g_signal_connect(state->video_area, "button-press-event", G_CALLBACK(on_video_area_button_press), state);
+    g_signal_connect(state->crop_overlay, "draw", G_CALLBACK(on_crop_overlay_draw), state);
+    g_signal_connect(state->crop_overlay, "button-press-event", G_CALLBACK(on_crop_overlay_button_press), state);
+    g_signal_connect(state->crop_overlay, "button-release-event", G_CALLBACK(on_crop_overlay_button_release), state);
+    g_signal_connect(state->crop_overlay, "motion-notify-event", G_CALLBACK(on_crop_overlay_motion_notify), state);
 
     gtk_widget_add_events(state->window, GDK_POINTER_MOTION_MASK | GDK_KEY_PRESS_MASK);
     g_signal_connect(state->window, "motion-notify-event", G_CALLBACK(on_window_motion_notify), state);
@@ -2136,6 +2476,10 @@ static void shutdown_app(GApplication*, gpointer user_data) {
     if (state->position_update_source != 0) {
         g_source_remove(state->position_update_source);
         state->position_update_source = 0;
+    }
+    if (state->crop_ant_animation_source != 0) {
+        g_source_remove(state->crop_ant_animation_source);
+        state->crop_ant_animation_source = 0;
     }
 
     if (state->mpv) {
