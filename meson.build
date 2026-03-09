@@ -5,6 +5,9 @@ project('mate-videocutter', 'cpp',
 gtk_dep = dependency('gtk+-3.0')
 mpv_dep = dependency('mpv')
 epoxy_dep = dependency('epoxy')
+libavformat_dep = dependency('libavformat')
+libavcodec_dep = dependency('libavcodec')
+libavutil_dep = dependency('libavutil')
 
 i18n = import('i18n')
 
@@ -16,7 +19,7 @@ executable(
   'mate-videocutter',
   'src/main.cpp',
   'src/langlist.cpp',
-  dependencies: [gtk_dep, mpv_dep, epoxy_dep],
+  dependencies: [gtk_dep, mpv_dep, epoxy_dep, libavformat_dep, libavcodec_dep, libavutil_dep],
   install: true
 )
 
